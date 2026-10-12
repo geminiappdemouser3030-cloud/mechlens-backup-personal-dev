@@ -3,7 +3,8 @@
 Bridges the text path of ``Gemma4ForConditionalGeneration``
 (``model.language_model`` + ``lm_head``) and the vision pipeline. For the standard
 variants (E2B / E4B / 31B / 26B-A4B) the vision encoder (``model.vision_tower``) and
-projector (``model.embed_vision``) are both bridged, enabling Phase 7 multimodal testing.
+projector (``model.embed_vision``) are both bridged. The declared verification
+phases cover text parity, hooks, and text quality; multimodal parity is separate.
 
 The same adapter also covers ``Gemma4UnifiedForConditionalGeneration`` (the
 encoder-free 12B variant, transformers >= 5.10): its text decoder is a strict
@@ -44,7 +45,7 @@ from transformer_lens.model_bridge.generalized_components.base import (
 
 class Gemma4ArchitectureAdapter(ArchitectureAdapter):
     """Adapter for Gemma 4 (`Gemma4ForConditionalGeneration` — multimodal, or
-    `Gemma4UnifiedForConditionalGeneration` — text-only 12B)."""
+    `Gemma4UnifiedForConditionalGeneration` — encoder-free multimodal 12B)."""
 
     # Phase 3 (processed/compatibility mode) folds LN into a single residual stream,
     # which the PLE residual mix, per-layer `layer_scalar` buffers, and the MoE branch
