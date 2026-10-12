@@ -3,8 +3,7 @@
 Bridges the text path of ``Gemma4ForConditionalGeneration``
 (``model.language_model`` + ``lm_head``) and the vision pipeline. For the standard
 variants (E2B / E4B / 31B / 26B-A4B) the vision encoder (``model.vision_tower``) and
-projector (``model.embed_vision``) are both bridged. The declared verification
-phases cover text parity, hooks, and text quality; multimodal parity is separate.
+projector (``model.embed_vision``) are both bridged, enabling Phase 7 multimodal testing.
 
 The same adapter also covers ``Gemma4UnifiedForConditionalGeneration`` (the
 encoder-free 12B variant, transformers >= 5.10): its text decoder is a strict
@@ -45,12 +44,13 @@ from transformer_lens.model_bridge.generalized_components.base import (
 
 class Gemma4ArchitectureAdapter(ArchitectureAdapter):
     """Adapter for Gemma 4 (`Gemma4ForConditionalGeneration` — multimodal, or
-    `Gemma4UnifiedForConditionalGeneration` — encoder-free multimodal 12B)."""
+    `Gemma4UnifiedForConditionalGeneration` — text-only 12B)."""
 
     # Phase 3 (processed/compatibility mode) folds LN into a single residual stream,
     # which the PLE residual mix, per-layer `layer_scalar` buffers, and the MoE branch
-    # can't represent. Phases 1 (HF parity), 2 (hooks), and 4 (text quality) apply.
-    applicable_phases: list[int] = [1, 2, 4]
+    # can't represent. Phases 1 (HF parity), 2 (hooks), 4 (text quality), and
+    # 7 (multimodal forward, generation, and caching) apply.
+    applicable_phases: list[int] = [1, 2, 4, 7]
 
     def __init__(self, cfg: Any) -> None:
         super().__init__(cfg)
@@ -59,8 +59,13 @@ class Gemma4ArchitectureAdapter(ArchitectureAdapter):
         # - Gemma4ForConditionalGeneration: vision_tower (encoder) + embed_vision (projector)
         # - Gemma4UnifiedForConditionalGeneration (12B): embed_vision only — encoder-free
         #   embedder that does raw-patch projection without an attention-based vision encoder.
-        arch = getattr(cfg, "architecture", "") or ""
-        self._is_unified = "Gemma4Unified" in arch
+        unified_arch = "Gemma4UnifiedForConditionalGeneration"
+        architectures = getattr(cfg, "architectures", None) or []
+        self._is_unified = (
+            getattr(cfg, "architecture", None) == unified_arch
+            or unified_arch in architectures
+            or getattr(cfg, "model_type", None) == "gemma4_unified"
+        )
         self.cfg.is_multimodal = True
 
         if hasattr(cfg, "vision_config"):
@@ -161,11 +166,21 @@ class Gemma4ArchitectureAdapter(ArchitectureAdapter):
         }
 
     def setup_component_testing(self, hf_model: Any, bridge_model: Any = None) -> None:
-        """Force eager attention so bridge and HF match (sliding/full layer mix)."""
-        if hasattr(hf_model, "config") and hasattr(hf_model.config, "_attn_implementation"):
-            hf_model.config._attn_implementation = "eager"
-        language_model = getattr(getattr(hf_model, "model", None), "language_model", None)
-        if language_model is not None and hasattr(language_model, "layers"):
-            for layer in language_model.layers:
-                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
-                    layer.self_attn.config._attn_implementation = "eager"
+        """Force eager attention on the reference and the bridge's wrapped HF model."""
+        models = (hf_model, getattr(bridge_model, "original_model", None))
+        for model in models:
+            if model is None:
+                continue
+            config = getattr(model, "config", None)
+            if config is not None:
+                config._attn_implementation = "eager"
+                # Do not rely solely on HF's private setter recursing into subconfigs.
+                for name in ("text_config", "vision_config", "audio_config"):
+                    subconfig = getattr(config, name, None)
+                    if subconfig is not None:
+                        subconfig._attn_implementation = "eager"
+            language_model = getattr(getattr(model, "model", None), "language_model", None)
+            if language_model is not None and hasattr(language_model, "layers"):
+                for layer in language_model.layers:
+                    if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "config"):
+                        layer.self_attn.config._attn_implementation = "eager"

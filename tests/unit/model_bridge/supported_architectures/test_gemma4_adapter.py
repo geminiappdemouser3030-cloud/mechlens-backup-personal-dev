@@ -2,6 +2,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from transformer_lens.config import TransformerBridgeConfig
 from transformer_lens.model_bridge.generalized_components import (
     DelegatedAttentionBlockBridge,
@@ -58,7 +60,7 @@ def test_config_flags():
     # Gemma4RMSNorm scales by weight directly — no (1 + weight) offset, unlike Gemma 1-3.
     assert a.cfg.rmsnorm_uses_offset is False
     assert a.cfg.positional_embedding_type == "rotary"
-    assert a.applicable_phases == [1, 2, 4]
+    assert a.applicable_phases == [1, 2, 4, 7]
 
 
 def test_config_flags_unified():
@@ -69,6 +71,30 @@ def test_config_flags_unified():
     assert "vision_encoder" not in a.component_mapping
     assert "vision_projector" in a.component_mapping
     assert a.component_mapping["vision_projector"].name == "model.embed_vision"
+
+
+@pytest.mark.parametrize(
+    "fields, is_unified",
+    [
+        ({"architecture": ARCH_UNIFIED}, True),
+        ({"architectures": [ARCH_UNIFIED]}, True),
+        ({"architectures": None, "model_type": "gemma4_unified"}, True),
+        ({"model_type": "gemma4_unified"}, True),
+        ({"architecture": ARCH}, False),
+        ({"architectures": [ARCH]}, False),
+        ({"model_type": "gemma4"}, False),
+        ({"architecture": "OtherGemma4UnifiedForConditionalGeneration"}, False),
+        ({}, False),
+    ],
+)
+def test_variant_detection_from_bridge_and_hf_config_fields(fields, is_unified):
+    cfg = _cfg(arch="")
+    for name, value in fields.items():
+        setattr(cfg, name, value)
+    adapter = Gemma4ArchitectureAdapter(cfg)
+    assert adapter._is_unified is is_unified
+    assert ("vision_encoder" in adapter.component_mapping) is not is_unified
+    assert adapter.component_mapping["vision_projector"].name == "model.embed_vision"
 
 
 def test_text_path_nested_under_language_model():
@@ -164,3 +190,32 @@ def test_gated_mlp_decomposition():
     assert mlp.submodules["gate"].name == "gate_proj"
     assert mlp.submodules["in"].name == "up_proj"
     assert mlp.submodules["out"].name == "down_proj"
+
+
+@pytest.mark.parametrize("arch", [ARCH, ARCH_UNIFIED])
+@pytest.mark.parametrize("with_bridge", [False, True])
+def test_component_testing_sets_eager_on_both_models(arch, with_bridge):
+    def make_model():
+        # Plain configs deliberately have no recursive HF property setter.
+        config = SimpleNamespace(
+            _attn_implementation="sdpa",
+            text_config=SimpleNamespace(_attn_implementation="sdpa"),
+            vision_config=SimpleNamespace(_attn_implementation="sdpa"),
+            audio_config=None,
+        )
+        attention = SimpleNamespace(config=SimpleNamespace(_attn_implementation="sdpa"))
+        language_model = SimpleNamespace(layers=[SimpleNamespace(self_attn=attention)])
+        return SimpleNamespace(config=config, model=SimpleNamespace(language_model=language_model))
+
+    reference = make_model()
+    wrapped = make_model()
+    bridge = SimpleNamespace(original_model=wrapped) if with_bridge else None
+    _adapter(arch).setup_component_testing(reference, bridge_model=bridge)
+
+    for model in (reference, wrapped) if with_bridge else (reference,):
+        assert model.config._attn_implementation == "eager"
+        assert model.config.text_config._attn_implementation == "eager"
+        assert model.config.vision_config._attn_implementation == "eager"
+        assert model.model.language_model.layers[0].self_attn.config._attn_implementation == "eager"
+    if not with_bridge:
+        assert wrapped.config._attn_implementation == "sdpa"
